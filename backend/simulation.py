@@ -325,24 +325,224 @@ class Simulation:
             else:
                 defender.move_randomly(self.map)
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import random
+
+class AttackerNet(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(AttackerNet, self).__init__()
+        self.fc1 = nn.Linear(state_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, action_size)
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+class RLTrainer:
+    def __init__(self, game_map, defender_positions):
+        self.game_map = game_map
+        self.defender_positions = defender_positions
+        
+        # RL Parameters
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = 0.0001
+        self.batch_size = 32
+        self.memory = deque(maxlen=10000)
+        
+        self.vision_range = DEFAULT_ATTACKER_PARAMS["vision_range"]
+        self.local_map_size = (2 * self.vision_range + 1) ** 2
+        self.defender_state_size = 3 * len(self.defender_positions)
+        self.state_size = self.defender_state_size + self.local_map_size
+        
+        self.action_size = 4  # up, down, left, right
+        
+        self.model = AttackerNet(self.state_size, self.action_size)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.criterion = nn.MSELoss()
+
+    def _is_valid_position(self, x, y):
+        # Check if position is within bounds and is a free cell
+        if not (0 <= x < self.game_map.width and 0 <= y < self.game_map.height):
+            return False
+        if not self.game_map.is_free(x, y):
+            return False
+            
+        # Check if position collides with any defender position
+        for dx, dy in self.defender_positions:
+            if x == dx and y == dy:
+                return False
+                
+        return True
+
+    def _get_random_valid_position(self):
+        valid_positions = []
+        for y in range(self.game_map.height):
+            for x in range(self.game_map.width):
+                if self._is_valid_position(x, y):
+                    valid_positions.append((x, y))
+        
+        if not valid_positions:
+            raise ValueError("No valid positions available for attacker placement")
+            
+        return random.choice(valid_positions)
+
+    def _get_state(self, simulation):
+        state = np.zeros(self.state_size)
+        
+        for i, defender in enumerate(simulation.defenders):
+            base_idx = i * 3
+            if base_idx + 2 < self.defender_state_size:  # Safety check
+                state[base_idx] = defender.x / simulation.map.width
+                state[base_idx + 1] = defender.y / simulation.map.height
+                state[base_idx + 2] = float(defender.alive)
+        
+        attacker = next((a for a in simulation.attackers if a.alive), None)
+        if attacker:
+            local_map = np.ones(self.local_map_size)  # Default to walls
+            idx = 0
+            for dy in range(-self.vision_range, self.vision_range + 1):
+                for dx in range(-self.vision_range, self.vision_range + 1):
+                    new_x, new_y = attacker.x + dx, attacker.y + dy
+                    if 0 <= new_x < simulation.map.width and 0 <= new_y < simulation.map.height:
+                        local_map[idx] = float(simulation.map.grid[new_y][new_x])
+                    idx += 1
+            state[self.defender_state_size:] = local_map
+        
+        return state
+
+    def _calculate_reward(self, simulation, attacker):
+        reward = 0
+        
+        if attacker.alive:
+            reward += 1
+        else:
+            reward -= 10
+            
+        dead_defenders = sum(1 for d in simulation.defenders if not d.alive)
+        reward += dead_defenders * 5
+        
+        reward += attacker.score * 0.1
+        
+        return reward
+
+    def train_episode(self):
+        x, y = self._get_random_valid_position()
+        attacker_positions = [(x, y)]
+        
+        strategy = Strategy(attacker_positions)
+        simulation = Simulation(self.game_map, strategy, self.defender_positions)
+        
+        total_reward = 0
+        done = False
+        
+        while not done:
+            state = self._get_state(simulation)
+            
+            if random.random() < self.epsilon:
+                action = random.randrange(self.action_size)
+            else:
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                    action = torch.argmax(self.model(state_tensor)).item()
+            
+            # Convert action to movement
+            moves = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+            dx, dy = moves[action]
+            
+            attacker = next((a for a in simulation.attackers if a.alive), None)
+            if attacker:
+                new_x = attacker.x + dx
+                new_y = attacker.y + dy
+                if simulation.map.is_free(new_x, new_y):
+                    attacker.move_to(new_x, new_y)
+            
+            simulation.update()
+            
+            reward = self._calculate_reward(simulation, attacker) if attacker else -10
+            total_reward += reward
+            done = not simulation.attackers_alive() or not simulation.defenders_alive()
+            next_state = self._get_state(simulation)
+            
+            self.memory.append((state, action, reward, next_state, done))
+            
+            if len(self.memory) >= self.batch_size:
+                self._train_batch()
+        
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        
+        return total_reward
+
+    def _train_batch(self):
+        batch = random.sample(self.memory, self.batch_size)
+        
+        states = np.array([transition[0] for transition in batch])
+        actions = np.array([transition[1] for transition in batch])
+        rewards = np.array([transition[2] for transition in batch])
+        next_states = np.array([transition[3] for transition in batch])
+        dones = np.array([transition[4] for transition in batch])
+        
+        states = torch.FloatTensor(states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor(next_states)
+        dones = torch.FloatTensor(dones)
+        
+        # Compute Q values
+        current_q_values = self.model(states).gather(1, actions.unsqueeze(1))
+        next_q_values = self.model(next_states).max(1)[0].detach()
+        target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+        
+        # Compute loss and update
+        loss = self.criterion(current_q_values.squeeze(), target_q_values)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def train(self, num_episodes):
+        rewards_history = []
+        
+        for episode in range(num_episodes):
+            reward = self.train_episode()
+            rewards_history.append(reward)
+            
+            if episode % 100 == 0:
+                avg_reward = np.mean(rewards_history[-100:] if len(rewards_history) >= 100 else rewards_history)
+                print(f"Episode {episode}, Average Reward: {avg_reward:.2f}, Epsilon: {self.epsilon:.2f}")
+        
+        return rewards_history
+
+    def save_model(self, path):
+        torch.save(self.model.state_dict(), path)
+
+    def load_model(self, path):
+        self.model.load_state_dict(torch.load(path))
+
 if __name__ == "__main__":
     grid = [
-      [0,0,0,0,0,0,0,0,0,0],
-      [0,0,1,1,1,1,1,1,0,0],
-      [0,0,0,0,0,0,0,0,0,0],
-      [0,0,0,1,0,0,1,1,0,0],
-      [0,0,0,1,0,0,1,0,0,0],
-      [0,1,1,1,0,0,1,0,0,0],
-      [0,0,0,1,0,0,1,0,0,0],
-      [0,0,0,0,0,0,0,0,0,0],
-      [0,1,1,1,0,1,1,1,1,0],
-      [0,0,0,0,0,0,0,0,0,0],
+        [0,0,0,0,0,0,0,0,0,0],
+        [0,0,1,1,1,1,1,1,0,0],
+        [0,0,0,0,0,0,0,0,0,0],
+        [0,0,0,1,0,0,1,1,0,0],
+        [0,0,0,1,0,0,1,0,0,0],
+        [0,1,1,1,0,0,1,0,0,0],
+        [0,0,0,1,0,0,1,0,0,0],
+        [0,0,0,0,0,0,0,0,0,0],
+        [0,1,1,1,0,1,1,1,1,0],
+        [0,0,0,0,0,0,0,0,0,0],
     ]
     game_map = Map(grid)
-    attacker_strategy = Strategy(attacker_positions=[(2,0), (7,0), (0,2), (9,5), (2,9), (7,9)])
     defender_positions = [(3,7), (2,7), (8,6)]
-    simulation = Simulation(game_map, attacker_strategy, defender_positions,
-                            attacker_params=DEFAULT_ATTACKER_PARAMS,
-                            defender_params=DEFAULT_DEFENDER_PARAMS)
-    result = simulation.run()
-    print(json.dumps(result, indent=2))
+    
+    trainer = RLTrainer(game_map, defender_positions)
+    rewards = trainer.train(10000)
+    trainer.save_model("attacker_model.pth")
+    
