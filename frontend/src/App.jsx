@@ -634,7 +634,9 @@ function App() {
       <GetSimulation
         getGrid={processGridState}
         onSimulationResult={(result) => {
-          setSimulationData(result);
+          setSimulationData({...result, 
+            routes,
+          });
           setShowSimulation(true);
         }}
       />
