@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import GetSimulation from "./GetSimulation";
 import "./App.css";
 import SimulationPlayback from "./SimulationPlayBack";
@@ -21,6 +21,9 @@ function App() {
   const [showSimulation, setShowSimulation] = useState(false);
   const [gptInputValue, setGptInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [routes, setRoutes] = useState({}); // Store routes for each player
+  const [activeRoutingPlayer, setActiveRoutingPlayer] = useState(null); // Track which player is being routed
+  const [lastClickedCell, setLastClickedCell] = useState(null); // Track last clicked cell for double-click detection
 
   // Simulation parameter states.
   const [attackerParams, setAttackerParams] = useState({
@@ -33,6 +36,112 @@ function App() {
     sound_radius: 4,
     reaction: 1.0,
   });
+  const [mousePosition, setMousePosition] = useState({ x: 0, y: 0 });
+  const gridRef = useRef(null);
+
+  // Get cell center coordinates
+  const getCellCenter = (rowIndex, colIndex) => {
+    const cells = document.querySelectorAll('.grid-cell');
+    const cellIndex = rowIndex * gridCols + colIndex;
+    const cell = cells[cellIndex];
+    if (!cell) return { x: 0, y: 0 };
+
+    const rect = cell.getBoundingClientRect();
+    const gridRect = gridRef.current.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width / 2 - gridRect.left,
+      y: rect.top + rect.height / 2 - gridRect.top
+    };
+  };
+
+  // Track mouse position relative to grid
+  const handleMouseMove = (e) => {
+    if (gridRef.current) {
+      const rect = gridRef.current.getBoundingClientRect();
+      setMousePosition({
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+      });
+    }
+  };
+
+  // Render route lines
+  const RouteLines = () => {
+    if (!activeRoutingPlayer && Object.keys(routes).length === 0) return null;
+
+    return (
+      <svg className="route-lines" style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+        {/* Existing route lines */}
+        {Object.entries(routes).map(([playerPos, route]) => {
+          const [playerRow, playerCol] = playerPos.split('-').map(Number);
+          const playerCenter = getCellCenter(playerRow, playerCol);
+
+          return (
+            <g key={playerPos}>
+              {/* Line from player to first point */}
+              {route.length > 0 && (
+                <line
+                  x1={playerCenter.x}
+                  y1={playerCenter.y}
+                  x2={getCellCenter(route[0].row, route[0].col).x}
+                  y2={getCellCenter(route[0].row, route[0].col).y}
+                  className="route-line"
+                />
+              )}
+              {/* Lines between route points */}
+              {route.map((point, index) => {
+                if (index === route.length - 1) return null;
+                const start = getCellCenter(point.row, point.col);
+                const end = getCellCenter(route[index + 1].row, route[index + 1].col);
+                return (
+                  <line
+                    key={`${point.row}-${point.col}-${index}`}
+                    x1={start.x}
+                    y1={start.y}
+                    x2={end.x}
+                    y2={end.y}
+                    className="route-line"
+                  />
+                );
+              })}
+            </g>
+          );
+        })}
+
+        {/* Active routing line following cursor */}
+        {activeRoutingPlayer && (
+          <g>
+            {/* If no route points yet, draw from player to cursor */}
+            {(!routes[activeRoutingPlayer] || routes[activeRoutingPlayer].length === 0) && (
+              <line
+                x1={getCellCenter(...activeRoutingPlayer.split('-').map(Number)).x}
+                y1={getCellCenter(...activeRoutingPlayer.split('-').map(Number)).y}
+                x2={mousePosition.x}
+                y2={mousePosition.y}
+                className="route-line route-line-preview"
+              />
+            )}
+            {/* If there are route points, draw from last point to cursor */}
+            {routes[activeRoutingPlayer] && routes[activeRoutingPlayer].length > 0 && (
+              <line
+                x1={getCellCenter(
+                  routes[activeRoutingPlayer][routes[activeRoutingPlayer].length - 1].row,
+                  routes[activeRoutingPlayer][routes[activeRoutingPlayer].length - 1].col
+                ).x}
+                y1={getCellCenter(
+                  routes[activeRoutingPlayer][routes[activeRoutingPlayer].length - 1].row,
+                  routes[activeRoutingPlayer][routes[activeRoutingPlayer].length - 1].col
+                ).y}
+                x2={mousePosition.x}
+                y2={mousePosition.y}
+                className="route-line route-line-preview"
+              />
+            )}
+          </g>
+        )}
+      </svg>
+    );
+  };
 
   // --- UPDATED processGridState ---
   // This function now checks if a cell is a wall by testing both
@@ -64,12 +173,33 @@ function App() {
       }
       processedGrid.push(newRow);
     }
+
+    const routeParsed = {}
+    for (let key in routes) {
+      routeParsed[key] = routes[key].map(({row, col}) => ({
+          coord: {
+            row, col
+          },
+          tickTime: 10
+      }))
+    }
+
+    console.log(JSON.stringify({
+      grid: processedGrid,
+      attacker_positions,
+      defender_positions,
+      attacker_params: attackerParams,
+      defender_params: defenderParams,
+      route_data: routeParsed
+    }))
+
     return {
       grid: processedGrid,
       attacker_positions,
       defender_positions,
       attacker_params: attackerParams,
       defender_params: defenderParams,
+      route_data: routeParsed
     };
   }
   // --- END UPDATED processGridState ---
@@ -80,22 +210,60 @@ function App() {
 
   // updateCell remains the same
   const updateCell = (rowIndex, colIndex) => {
+    if (selectedTool === "router") {
+      const cellKey = `${rowIndex}-${colIndex}`;
+      const cell = grid[rowIndex][colIndex];
+
+      if (activeRoutingPlayer == null && cell && typeof cell === "object" && cell.type === "player") {
+        // Clicking on a player initiates routing for that player
+        setActiveRoutingPlayer(`${rowIndex}-${colIndex}`);
+        // Clear existing route for this player
+        setRoutes(prev => ({ ...prev, [`${rowIndex}-${colIndex}`]: [] }));
+        return;
+      }
+
+      if (activeRoutingPlayer) {
+        if (cellKey === lastClickedCell) {
+          // Double click on same cell exits routing mode
+          setActiveRoutingPlayer(null);
+          setLastClickedCell(null);
+        } else {
+          // Add new point to route
+          setRoutes(prev => ({
+            ...prev,
+            [activeRoutingPlayer]: [
+              ...(prev[activeRoutingPlayer] || []),
+              { row: rowIndex, col: colIndex }
+            ]
+          }));
+          setLastClickedCell(cellKey);
+        }
+      }
+      return;
+    }
+
+    // Existing cell update logic
     setGrid((prevGrid) => {
       const newGrid = prevGrid.map((row) => [...row]);
       const current = newGrid[rowIndex][colIndex];
       if (selectedTool === "eraser") {
+        // When erasing a player, also remove their route
+        if (current && current.type === "player") {
+          setRoutes(prev => {
+            const newRoutes = { ...prev };
+            delete newRoutes[`${rowIndex}-${colIndex}`];
+            return newRoutes;
+          });
+        }
         newGrid[rowIndex][colIndex] = null;
       } else if (
         current &&
         typeof current === "object" &&
         current.type === selectedTool
       ) {
-        // Rotate clockwise by 45 degrees.
-        current.orientation =
-          (current.orientation + Math.PI / 4) % (2 * Math.PI);
+        current.orientation = (current.orientation + Math.PI / 4) % (2 * Math.PI);
         newGrid[rowIndex][colIndex] = current;
       } else {
-        // Place a new agent object with starting orientation 0.
         newGrid[rowIndex][colIndex] = { type: selectedTool, orientation: 0 };
       }
       return newGrid;
@@ -120,31 +288,36 @@ function App() {
   }, []);
 
   // renderCellContent remains essentially the same.
-  const renderCellContent = (cellValue) => {
-    if (cellValue && typeof cellValue === "object") {
-      if (cellValue.type === "wall") return "🟦";
-      let baseEmoji = "";
-      if (cellValue.type === "player") {
-        baseEmoji = "👮";
-      } else if (cellValue.type === "defender") {
-        baseEmoji = "🦹";
-      }
-      const angleDeg = (cellValue.orientation * 180) / Math.PI;
-      return (
+  const renderCellContent = (cellValue, rowIndex, colIndex) => {
+    const cellContent = cellValue && typeof cellValue === "object" ? (
+      cellValue.type === "wall" ? (
+        "🟦"
+      ) : (
         <span>
-          {baseEmoji}
+          {cellValue.type === "player" ? "👮" : "🦹"}
           <span
             className="viewport-arrow"
-            style={{ transform: `rotate(${angleDeg}deg)` }}
+            style={{ transform: `rotate(${cellValue.orientation * 180 / Math.PI}deg)` }}
           >
             ➤
           </span>
         </span>
-      );
-    } else if (cellValue === "wall") {
-      return "⬛";
-    }
-    return "";
+      )
+    ) : (
+      cellValue === "wall" ? "⬛" : ""
+    );
+
+    // Add route point indicators
+    const isRoutePoint = Object.entries(routes).some(([playerPos, route]) =>
+      route.some(point => point.row === rowIndex && point.col === colIndex)
+    );
+
+    return (
+      <div className={`cell-content ${isRoutePoint ? 'route-point' : ''}`}>
+        {cellContent}
+        {isRoutePoint && <div className="route-indicator" />}
+      </div>
+    );
   };
 
   const handleClaudeCall = useCallback(async (input) => {
@@ -215,7 +388,7 @@ function App() {
       const response = await fetch("http://127.0.0.1:5000/ask-claude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({prompt}),
+        body: JSON.stringify({ prompt }),
       });
 
       // Check if the response is OK
@@ -258,7 +431,10 @@ function App() {
         <h3>Tools</h3>
         <button
           className={`tool-button ${selectedTool === "player" ? "active" : ""}`}
-          onClick={() => setSelectedTool("player")}
+          onClick={() => {
+            setSelectedTool("player")
+            setActiveRoutingPlayer(null);
+          }}
         >
           Player
         </button>
@@ -280,6 +456,16 @@ function App() {
           onClick={() => setSelectedTool("eraser")}
         >
           Eraser
+        </button>
+
+        <button
+          className={`tool-button ${selectedTool === "router" ? "active" : ""}`}
+          onClick={() => {
+            setSelectedTool("router");
+            setActiveRoutingPlayer(null);
+          }}
+        >
+          Router
         </button>
 
         <div className="slider-group">
@@ -422,8 +608,11 @@ function App() {
 
       <div
         className="grid"
+        ref={gridRef}
         onMouseUp={() => setIsMouseDown(false)}
         onMouseLeave={() => setIsMouseDown(false)}
+        onMouseMove={handleMouseMove}
+        style={{ position: 'relative' }}
       >
         {grid.map((row, rowIndex) => (
           <div key={rowIndex} className="grid-row">
@@ -434,11 +623,12 @@ function App() {
                 onMouseDown={() => handleMouseDown(rowIndex, colIndex)}
                 onMouseEnter={() => handleMouseEnter(rowIndex, colIndex)}
               >
-                {renderCellContent(cell)}
+                {renderCellContent(cell, rowIndex, colIndex)}
               </div>
             ))}
           </div>
         ))}
+        <RouteLines />
       </div>
 
       <GetSimulation
